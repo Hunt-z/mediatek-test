@@ -1,6 +1,6 @@
 #!/bin/bash
 # Title: Smart MediaTek Loader (Strict Config)
-# Version: 11.0
+# Version: 2.0 (Fixed)
 # Author: Huntz
 
 set -u
@@ -17,10 +17,6 @@ MAX_INDEX=6    # Max radios to scan
 have() { command -v "$1" >/dev/null 2>&1; }
 log_y() { have LOG && LOG yellow "$1" || echo -e "\033[33m[*] $1\033[0m"; }
 log_g() { have LOG && LOG green  "$1" || echo -e "\033[32m[+] $1\033[0m"; }
-err() {
-  if have ERROR_DIALOG; then ERROR_DIALOG "$1"; else echo "ERROR: $1" >&2; fi
-  exit 1
-}
 
 # ==========================================
 # 1. SMART SCANNING
@@ -40,7 +36,9 @@ done
 declare -a FOUND_DEVICES=()
 
 # B. Scan USB Bus
+# Only iterate if files exist to avoid literal wildcard expansion
 for dev in /sys/bus/usb/devices/*; do
+    [ ! -e "$dev" ] && continue
     [ ! -f "$dev/idVendor" ] && continue
     [ ! -f "$dev/idProduct" ] && continue
 
@@ -66,6 +64,7 @@ for dev in /sys/bus/usb/devices/*; do
         HIGHEST_SCORE=-1
         
         for endpoint_dir in "$dev":*; do
+            [ ! -d "$endpoint_dir" ] && continue
             if [ -f "$endpoint_dir/bInterfaceClass" ]; then
                 CLASS=$(cat "$endpoint_dir/bInterfaceClass")
                 
@@ -77,6 +76,9 @@ for dev in /sys/bus/usb/devices/*; do
                 EP_ID=$(echo "$endpoint_dir" | awk -F: '{print $NF}')
                 EP_NUM=$(echo "$EP_ID" | awk -F. '{print $2}')
                 
+                # Default to 0 if EP_NUM is empty
+                [ -z "$EP_NUM" ] && EP_NUM=0
+
                 FINAL_SCORE=$((CURRENT_SCORE + EP_NUM))
                 
                 if [ "$FINAL_SCORE" -gt "$HIGHEST_SCORE" ]; then
@@ -113,10 +115,7 @@ for DEV_PATH in "${FOUND_DEVICES[@]}"; do
     RADIO_NAME="radio${CURRENT_IDX}"             # radio2
     IFACE_NAME="wlan${CURRENT_IDX}mon"           # wlan2mon
     
-    # The Wireless Config Section Name (e.g., 'default_radio2')
     WIFI_IFACE_SEC="default_${RADIO_NAME}"       
-    
-    # The PineAP Config Section Name (e.g., 'wlan2mon')
     PINE_IFACE_SEC="${IFACE_NAME}"
 
     UCI_PATH=$(readlink -f "$DEV_PATH" | sed 's#^/sys/devices/##')
@@ -124,6 +123,10 @@ for DEV_PATH in "${FOUND_DEVICES[@]}"; do
 
     # --- A. /etc/config/wireless ---
     
+    # 0. Safety: Clear previous configs to prevent ghost settings
+    uci -q delete wireless.${RADIO_NAME}
+    uci -q delete wireless.${WIFI_IFACE_SEC}
+
     # 1. Config 'wifi-device'
     uci set wireless.${RADIO_NAME}=wifi-device
     uci set wireless.${RADIO_NAME}.type='mac80211'
@@ -142,6 +145,9 @@ for DEV_PATH in "${FOUND_DEVICES[@]}"; do
 
     # --- B. /etc/config/pineapd ---
     
+    # Safety Clean
+    uci -q delete pineapd.${PINE_IFACE_SEC}
+
     # 3. Config 'interface' (Section: wlan2mon)
     uci set pineapd.${PINE_IFACE_SEC}=interface
     uci set pineapd.${PINE_IFACE_SEC}.device="${IFACE_NAME}"
@@ -159,7 +165,7 @@ done
 # ==========================================
 # 4. CLEANUP STALE CONFIGS
 # ==========================================
-# If radios are unplugged, disable their entries but don't delete them.
+# If radios are unplugged, disable their entries.
 
 CLEANUP_IDX=$CURRENT_IDX
 while [ $CLEANUP_IDX -le $MAX_INDEX ]; do
@@ -171,7 +177,10 @@ while [ $CLEANUP_IDX -le $MAX_INDEX ]; do
     if uci -q get wireless.${RADIO_NAME} >/dev/null; then
         log_y "Disabling stale wireless: $RADIO_NAME"
         uci set wireless.${RADIO_NAME}.disabled='1'
-        uci set wireless.${WIFI_IFACE_SEC}.disabled='1'
+        # Check if section exists before setting
+        if uci -q get wireless.${WIFI_IFACE_SEC} >/dev/null; then
+             uci set wireless.${WIFI_IFACE_SEC}.disabled='1'
+        fi
     fi
 
     # Disable PineAP
@@ -227,7 +236,7 @@ while [ $WAIT_IDX -lt $TARGET_IDX ]; do
     
     if [ $LOADED -eq 0 ]; then
         echo " [TIMEOUT]"
-        log_y "Warning: $IFACE_NAME did not appear."
+        log_y "Warning: $IFACE_NAME did not appear. (Driver renaming issue?)"
     fi
     WAIT_IDX=$((WAIT_IDX + 1))
 done
